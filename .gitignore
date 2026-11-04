@@ -1,0 +1,24 @@
+.claude/
+*.pyc
+*~
+.idea
+.coverage
+.tox
+.DS_Store
+.python-version
+.pytest_cache/
+pika.iml
+codegen
+pika.egg-info
+debug/
+examples/pika
+examples/blocking/pika
+atlassian*xml
+build
+dist
+docs/_build
+venv*/
+env/
+testdata/*.conf
+# pyright type information
+typings/

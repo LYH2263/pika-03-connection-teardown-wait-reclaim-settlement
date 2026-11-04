@@ -17,13 +17,13 @@ jobs:
         python-version: [ '3.7', '3.8', '3.9' ]
         test-tls: [true, false]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
       - name: Cache installers
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           # Note: the cache path is relative to the workspace directory
           # https://docs.github.com/en/actions/using-workflows/caching-dependencies-to-speed-up-workflows#using-the-cache-action
@@ -38,7 +38,7 @@ jobs:
       - name: Test with pytest
         run: hatch run test -- -v --cov=pika --cov-report=xml ${{ matrix.test-tls && '--use-tls' || '' }}
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@v7
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: ./coverage.xml
@@ -57,9 +57,9 @@ jobs:
           - 5672:5672
           - 5671:5671
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install dependencies
@@ -69,7 +69,7 @@ jobs:
       - name: Test with pytest
         run: hatch run test -- -v --cov=pika --cov-report=xml
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@v7
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: ./coverage.xml

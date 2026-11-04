@@ -8,7 +8,7 @@ from __future__ import annotations
 import abc
 import functools
 import logging
-from typing import Any, Callable, Optional, Sequence, Union
+from typing import Any, Callable, Optional, Sequence, Tuple, Union
 
 import pika.compat
 import pika.exceptions
@@ -89,6 +89,25 @@ class BaseConnection(connection.Connection):
         self._connection_workflow = None
         self._transport = None
         self._got_eof = False
+
+    def _settlement_snapshot(
+        self
+    ) -> Tuple[Tuple[Any, ...], Optional[nbio_interface.AbstractStreamTransport],
+               Optional[connection_workflow.AbstractAMQPConnectionWorkflow],
+               bool]:
+        # See Connection._settlement_snapshot. Besides the core teardown
+        # state, an outer window must keep seeing the transport/workflow
+        # pairing and EOF flag it had on entry.
+        core_token = super()._settlement_snapshot()
+        return (core_token, self._transport, self._connection_workflow,
+                self._got_eof)
+
+    def _settlement_restore(self, token: Tuple[Any, ...]) -> None:
+        core_token, transport, connection_workflow, got_eof = token
+        super()._settlement_restore(core_token)
+        self._transport = transport
+        self._connection_workflow = connection_workflow
+        self._got_eof = got_eof
 
     def __repr__(self) -> str:
 
@@ -305,6 +324,17 @@ class BaseConnection(connection.Connection):
             '_abort_connection_workflow() may be called only when '
             'connection is opening.')
 
+        settlement = self._teardown_settlement
+        window = settlement.current
+        route = 'workflow' if self._transport is None else 'transport'
+
+        if (window is not None and settlement.abort_already_routed()):
+            # An outer window on this same connection already initiated the
+            # physical teardown; don't abort the workflow/transport twice,
+            # just reclaim this nested request against the inner window.
+            window.record('nested_teardown_reclaimed', route)
+            return
+
         if self._transport is None:
             # NOTE: this is possible only when user calls Connection.close() to
             # interrupt internally-initiated connection establishment.
@@ -317,6 +347,8 @@ class BaseConnection(connection.Connection):
             # This will result in call to _on_connection_workflow_done() upon
             # completion
             self._connection_workflow.abort()  # type: ignore
+            if window is not None:
+                window.record_abort_route('workflow')
         else:
             # NOTE: we can't use self._connection_workflow.abort() in this case,
             # because it would result in infinite recursion as we're called
@@ -330,6 +362,8 @@ class BaseConnection(connection.Connection):
             # This completes asynchronously, culminating in call to our method
             # `connection_lost()`
             self._transport.abort()
+            if window is not None:
+                window.record_abort_route('transport')
 
     def _on_connection_workflow_done(
             self, conn_or_exc: Union[BaseConnection, Exception]) -> None:
@@ -404,12 +438,21 @@ class BaseConnection(connection.Connection):
         `Connection._on_stream_terminated()` asynchronously when complete.
 
         """
+        settlement = self._teardown_settlement
+        window = settlement.current
+
         if not self._opened:
             self._abort_connection_workflow()
+        elif (window is not None and settlement.abort_already_routed()):
+            # An outer window on this same connection already aborted the
+            # transport; don't abort it a second time.
+            window.record('nested_teardown_reclaimed', 'transport')
         else:
             # This completes asynchronously, culminating in call to our method
             # `connection_lost()`
             self._transport.abort()  # type: ignore
+            if window is not None:
+                window.record_abort_route('transport')
 
     def _adapter_emit_data(self, data: bytes) -> None:
         """Take ownership of data and send it to AMQP server as soon as

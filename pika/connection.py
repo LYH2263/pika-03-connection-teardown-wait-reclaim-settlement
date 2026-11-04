@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import abc
 import ast
+import contextlib
 import copy
 import functools
 import logging
@@ -13,7 +14,7 @@ import math
 import numbers
 import platform
 import ssl
-from typing import Any, Dict, Optional, Sequence, Tuple, Type, TypeVar, Union, Callable, cast, TYPE_CHECKING
+from typing import Any, Dict, FrozenSet, Iterator, List, Optional, Sequence, Tuple, Type, TypeVar, Union, Callable, cast, TYPE_CHECKING
 from urllib.parse import unquote as url_unquote, parse_qs as url_parse_qs, urlparse
 
 import pika.callback
@@ -990,6 +991,110 @@ class SSLOptions:
         self.server_hostname = server_hostname
 
 
+class _TeardownSettlement:
+    """Per-connection LIFO stack of nested teardown settlement windows.
+
+    Connection hosts (BaseConnection and its Select/Asyncio/Gevent/Tornado
+    adapters, the BlockingConnection wrapper, and the Twisted wrapper)
+    explicitly declare windows through
+    :meth:`Connection._teardown_window`. While a window is open, teardown
+    settlement on the same connection - abort routing, channel meta-close
+    reclaim, and the completion surfaces of close/open waits - is scoped to
+    the innermost window; when the window exits, every participant restores
+    the snapshot it took on entry, so an inner close/abort/loseConnection can
+    neither drain nor write through waits pending in an outer window.
+
+    The stack is empty unless a window is explicitly declared; every
+    teardown hot path keeps its legacy behavior while the stack is empty.
+    """
+
+    __slots__ = ('connection', '_windows')
+
+    def __init__(self, connection: Connection) -> None:
+        self.connection = connection
+        self._windows: List[_TeardownWindow] = []
+
+    def begin(self, participants: Tuple[Any, ...]) -> _TeardownWindow:
+        # The connection itself is always the first participant so that the
+        # core teardown state (_error, connection_state, _channels) is
+        # restored together with host-specific wait handles.
+        window = _TeardownWindow(self, (self.connection,) + participants)
+        self._windows.append(window)
+        return window
+
+    def end(self, window: _TeardownWindow) -> None:
+        top = self._windows.pop()
+        assert top is window, \
+            'teardown settlement windows must be exited in LIFO order'
+        top._restore()  # pylint: disable=W0212
+
+    @property
+    def current(self) -> Optional[_TeardownWindow]:
+        """The innermost open window, or None when no window is open."""
+        return self._windows[-1] if self._windows else None
+
+    @property
+    def active(self) -> bool:
+        return bool(self._windows)
+
+    def abort_already_routed(self) -> bool:
+        """Return whether any open window already initiated a physical
+        teardown action (connection-workflow abort, transport abort, or
+        loseConnection). A nested teardown request must not invoke the
+        physical action a second time.
+        """
+        return any(window.abort_route is not None for window in self._windows)
+
+
+class _TeardownWindow:
+    """A single frame of the nested teardown settlement.
+
+    `events` is the ordered, host-neutral ledger of teardown facts observed
+    while the window is innermost. Host tests read the same ledger across
+    BlockingConnection, BaseConnection hosts, and Twisted even though their
+    completion surfaces (pumped _CallbackResult, workflow/transport abort
+    fork, loseConnection plus Deferred reclaim) stay distinct.
+    """
+
+    __slots__ = ('_settlement', '_participants', '_tokens', 'events',
+                 'abort_route', 'terminate_requested', 'channels_at_entry')
+
+    def __init__(self, settlement: _TeardownSettlement,
+                 participants: Tuple[Any, ...]) -> None:
+        self._settlement = settlement
+        self._participants = participants
+        self._tokens = [
+            participant._settlement_snapshot()  # pylint: disable=W0212
+            for participant in participants
+        ]
+        self.events: List[Tuple[Any, ...]] = []
+        # None | 'workflow' | 'transport' | 'loseConnection'
+        self.abort_route: Optional[str] = None
+        self.terminate_requested: bool = False
+        # Channels that already existed when this (possibly nested) window
+        # opened; a nested window defers their meta-close reclaim to the
+        # window that owns them.
+        self.channels_at_entry: FrozenSet[int] = frozenset(
+            settlement.connection._channels)
+
+    @property
+    def nested(self) -> bool:
+        """True while an ancestor settlement window is still open."""
+        return self._settlement._windows[0] is not self  # pylint: disable=W0212
+
+    def record(self, event: str, *details: Any) -> None:
+        self.events.append((event,) + tuple(details))
+
+    def record_abort_route(self, route: str) -> None:
+        self.abort_route = route
+        self.record('abort_route', route)
+
+    def _restore(self) -> None:
+        for participant, token in zip(self._participants, self._tokens):
+            # pylint: disable=W0212
+            participant._settlement_restore(token)
+
+
 class Connection(pika.compat.AbstractBase):  # type: ignore
     """This is the core class that implements communication with RabbitMQ. This
     class should not be invoked directly but rather through the use of an
@@ -1103,6 +1208,12 @@ class Connection(pika.compat.AbstractBase):  # type: ignore
 
         self._init_connection_state()
 
+        # Per-connection stack of nested teardown settlement windows. It is
+        # not reset by _init_connection_state(): an inner window can observe
+        # a window-local stream termination while an outer window keeps
+        # waiting on the same connection.
+        self._teardown_settlement = _TeardownSettlement(self)
+
         # Add the on connection error callback
         self.callbacks.add(
             0, self.ON_CONNECTION_ERROR, on_open_error_callback or
@@ -1181,6 +1292,48 @@ class Connection(pika.compat.AbstractBase):  # type: ignore
             self.add_on_connection_blocked_callback(self._on_connection_blocked)
             self.add_on_connection_unblocked_callback(
                 self._on_connection_unblocked)
+
+    def _settlement_snapshot(
+            self) -> Tuple[Optional[Exception], int, Dict[int, Channel]]:
+        """Capture the core teardown state seen by a settlement window on
+        entry. Hosts extend this to snapshot their own wait handles
+        (BlockingConnection close-result sinks, Twisted Deferreds, and the
+        BaseConnection transport/workflow references).
+        """
+        return self._error, self.connection_state, dict(self._channels)
+
+    def _settlement_restore(
+            self, token: Tuple[Optional[Exception], int,
+                               Dict[int, Channel]]) -> None:
+        """Restore the core teardown state of an outer window on inner exit.
+        Channels created and reclaimed inside the inner window stay gone;
+        channels deferred to the outer window are put back un-meta-closed.
+        """
+        error, connection_state, channels = token
+        self._error = error
+        self._set_connection_state(connection_state)
+        self._channels = channels
+
+    @contextlib.contextmanager
+    def _teardown_window(self, *participants: Any) -> Iterator[_TeardownWindow]:
+        """Declare a nested teardown settlement window on this connection.
+
+        Teardown settlement (abort routing, channel meta-close reclaim,
+        close/open completion) occurring in the innermost window is recorded
+        on the yielded window ledger and never writes through waits pending
+        in outer windows; exiting the block (even via exception) restores
+        every participant's entry snapshot in LIFO order. With no window
+        declared, all teardown hot paths behave exactly as before.
+
+        :param participants: extra objects implementing
+            ``_settlement_snapshot()`` / ``_settlement_restore(token)``, such
+            as the BlockingConnection or TwistedProtocolConnection wrapper.
+        """
+        window = self._teardown_settlement.begin(tuple(participants))
+        try:
+            yield window
+        finally:
+            self._teardown_settlement.end(window)
 
     def add_on_close_callback(
             self, callback: Callable[[Connection, Exception], Any]) -> None:
@@ -2084,6 +2237,11 @@ class Connection(pika.compat.AbstractBase):  # type: ignore
         # So it won't mess with the stack
         self._remove_heartbeat()
 
+        window = self._teardown_settlement.current
+        if window is not None:
+            window.terminate_requested = True
+            window.record('terminate_requested', error)
+
         # Begin disconnection of stream or termination of connection workflow
         self._adapter_disconnect_stream()
 
@@ -2156,12 +2314,29 @@ class Connection(pika.compat.AbstractBase):  # type: ignore
         # Transition to closed state
         self._set_connection_state(self.CONNECTION_CLOSED)
 
-        # Inform our channel proxies, if any are still around
-        for channel in list(self._channels.keys()):
-            if channel not in self._channels:
+        window = self._teardown_settlement.current
+        if window is not None:
+            window.record('stream_terminated', error, self._opened)
+
+        # Inform our channel proxies, if any are still around. Inside a
+        # nested settlement window, channels an outer window already owned
+        # when the inner one opened are deferred to that outer window, so an
+        # inner teardown can not meta-close waits pending out of its scope.
+        for channel_number in list(self._channels.keys()):
+            if channel_number not in self._channels:
+                continue
+            if (window is not None and window.nested and
+                    channel_number in window.channels_at_entry):
+                window.record('channel_reclaim_deferred', channel_number,
+                              self._error)
                 continue
             # pylint: disable=W0212
-            self._channels[channel]._on_close_meta(self._error)
+            self._channels[channel_number]._on_close_meta(self._error)
+            if window is not None:
+                window.record('channels_reclaimed', channel_number, self._error)
+
+        if window is not None:
+            window.record('close_waiters_settled', self._opened, self._error)
 
         # Inform interested parties
         if not self._opened:
@@ -2173,8 +2348,13 @@ class Connection(pika.compat.AbstractBase):  # type: ignore
             self.callbacks.process(0, self.ON_CONNECTION_CLOSED, self, self,
                                    self._error)
 
-        # Reset connection properties
-        self._init_connection_state()
+        if window is None:
+            # Reset connection properties
+            self._init_connection_state()
+        else:
+            # A window owns this termination: skip the global state wipe and
+            # let the window exit restore the outer scope's view.
+            window.record('state_reset_deferred', self._opened)
 
     def _process_callbacks(self, frame_value: frame.Frame) -> bool:
         """Process the callbacks for the frame if the frame is a method frame

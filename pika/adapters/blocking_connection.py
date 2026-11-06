@@ -416,6 +416,9 @@ class BlockingConnection:
         # Receives on_close_callback args from Connection
         self._closed_result = _CallbackResult(self._OnClosedArgs)
 
+        self._closed_result_sinks: list = [self._closed_result]
+        self._pump_depth = 0
+
         # Store exceptions for server-initiated channel closures
         self._server_channel_closures: deque[Exception] = deque()
 
@@ -457,6 +460,76 @@ class BlockingConnection:
                 self._impl.ioloop.close()
             self._ready_events.clear()
             self._closed_result.reset()
+
+    def _current_closed_result(self) -> _CallbackResult:
+        """The close-result sink that currently receives the impl
+        on_close_callback: the innermost settlement-window sink, or
+        `_closed_result` when no window is declared.
+        """
+        return self._closed_result_sinks[-1]
+
+    def _swap_closed_result_sink(
+            self, inner_sink: _CallbackResult) -> _CallbackResult:
+        """Unregister the current close-result sink from the impl and
+        register `inner_sink` in its place. Returns the displaced sink.
+        """
+        outer_sink = self._closed_result_sinks[-1]
+        callbacks = self._impl.callbacks
+        callbacks.remove(0, pika.connection.Connection.ON_CONNECTION_CLOSED,
+                         outer_sink.set_value_once)
+        callbacks.add(0, pika.connection.Connection.ON_CONNECTION_CLOSED,
+                      inner_sink.set_value_once, False)
+        self._closed_result_sinks.append(inner_sink)
+        return outer_sink
+
+    def _settlement_snapshot(self) -> _CallbackResult:
+        """Participant protocol for Connection._teardown_window. Install a
+        fresh inner close-result sink for the window so a close delivery
+        settles the inner pump/wait instead of the outer pending wait.
+        """
+        return self._swap_closed_result_sink(_CallbackResult(
+            self._OnClosedArgs))
+
+    def _settlement_restore(self, outer_sink: _CallbackResult) -> None:
+        """Participant protocol for Connection._teardown_window. Reinstall
+        the outer sink and hand a close observed in the inner window down to
+        it exactly once. The shared ioloop is not closed here; the outermost
+        pump owns `_cleanup()`.
+        """
+        inner_sink = self._closed_result_sinks.pop()
+        assert inner_sink is not outer_sink
+        callbacks = self._impl.callbacks
+        callbacks.remove(0, pika.connection.Connection.ON_CONNECTION_CLOSED,
+                         inner_sink.set_value_once)
+        callbacks.add(0, pika.connection.Connection.ON_CONNECTION_CLOSED,
+                      outer_sink.set_value_once, False)
+        if inner_sink.ready and not outer_sink.ready:
+            closed_args = inner_sink.value
+            outer_sink.set_value_once(closed_args.connection, closed_args.error)
+
+    @contextlib.contextmanager
+    def _settlement_window(self) -> Generator[Any, None, None]:
+        """Declare a nested teardown settlement window bound to the same
+        underlying connection (see `Connection._teardown_window`). An inner
+        close settles the inner close-result sink; on exit the outer sink is
+        restored and a real teardown is handed down exactly once.
+        """
+        with self._impl._teardown_window(self) as window:
+            yield window
+
+    @contextlib.contextmanager
+    def _nested_pump_settlement(self) -> Generator[None, None, None]:
+        """Blocking-only close-sink isolation for a reentrant
+        `_flush_output` pump. Unlike `_settlement_window`, this does not
+        scope the core connection state, so the outermost pump keeps legacy
+        teardown behavior while its nested pump can not consume the outer
+        close-result wait.
+        """
+        outer_sink = self._settlement_snapshot()
+        try:
+            yield
+        finally:
+            self._settlement_restore(outer_sink)
 
     @contextlib.contextmanager
     def _acquire_event_dispatch(self) -> Generator[bool, Any, None]:
@@ -560,48 +633,67 @@ class BlockingConnection:
         return error
 
     def _flush_output(self, *waiters: Callable[[], bool]) -> None:
-        """
-        Flush output and process input while waiting for any of the given callbacks to return true.
-        The wait is aborted upon connection-close. Otherwise, processing continues until the output
-        is flushed AND at least one of the callbacks returns true. If there are no callbacks, then
+        """ Flush output and process input while waiting for any of the given
+        callbacks to return true. The wait is aborted upon connection-close.
+        Otherwise, processing continues until the output is flushed AND at least
+        one of the callbacks returns true. If there are no callbacks, then
         processing ends when all output is flushed.
 
-        :param waiters: sequence of zero or more callables taking no args and returning true when
-            it's time to stop processing. Their results are OR'ed together.
-        :raises Exception: exceptions passed by impl if opening of connection fails or connection
-            closes.
+        :param waiters: sequence of zero or more callables taking no args and
+                        returning true when it's time to stop processing.
+                        Their results are OR'ed together.
+        :raises: exceptions passed by impl if opening of connection fails or
+            connection closes.
         """
         if self.is_closed:
             raise exceptions.ConnectionWrongStateError()
 
-        # Conditions for terminating the processing loop:
-        #   connection closed
-        #         OR
-        #   empty outbound buffer and no waiters
-        #         OR
-        #   empty outbound buffer and any waiter is ready
-        def is_done() -> bool:
-            return (self._closed_result.ready or
-                    ((not self._impl._transport or
-                      self._impl._get_write_buffer_size() == 0) and
-                     (not waiters or any(ready() for ready in waiters))))
+        self._pump_depth += 1
+        # A reentrant pump (a callback invoked from poll() flushes again) gets
+        # its own inner close-result sink so the nested close can not consume
+        # the outer pump's pending wait.
+        nested = (self._nested_pump_settlement()
+                  if self._pump_depth > 1 else contextlib.nullcontext())
+        try:
+            with nested:
+                closed_result = self._current_closed_result()
 
-        # Process I/O until our completion condition is satisfied
-        while not is_done():
-            self._impl.ioloop.poll()
-            self._impl.ioloop.process_timeouts()
+                # Conditions for terminating the processing loop:
+                #   connection closed
+                #         OR
+                #   empty outbound buffer and no waiters
+                #         OR
+                #   empty outbound buffer and any waiter is ready
+                def is_done():
+                    return (closed_result.ready or (
+                        (not self._impl._transport or
+                         self._impl._get_write_buffer_size() == 0) and
+                        (not waiters or any(ready() for ready in waiters))))
 
-        if self._closed_result.ready:
-            try:
-                if not isinstance(self._closed_result.value.error,
-                                  exceptions.ConnectionClosedByClient):
-                    LOGGER.error('Unexpected connection close detected: %r',
-                                 self._closed_result.value.error)
-                    raise self._closed_result.value.error
-                LOGGER.info('User-initiated close: result=%r',
-                            self._closed_result.value)
-            finally:
-                self._cleanup()
+                # Process I/O until our completion condition is satisfied
+                while not is_done():
+                    self._impl.ioloop.poll()
+                    self._impl.ioloop.process_timeouts()
+
+                if closed_result.ready:
+                    try:
+                        if not isinstance(closed_result.value.error,
+                                          exceptions.ConnectionClosedByClient):
+                            LOGGER.error(
+                                'Unexpected connection close detected: %r',
+                                closed_result.value.error)
+                            raise closed_result.value.error
+                        else:
+                            LOGGER.info('User-initiated close: result=%r',
+                                        closed_result.value)
+                    finally:
+                        # Only the outermost sink owns cleanup; a window-scoped
+                        # or nested pump must not close the shared ioloop out
+                        # from under the still-waiting outer pump.
+                        if closed_result is self._closed_result:
+                            self._cleanup()
+        finally:
+            self._pump_depth -= 1
 
     def _request_channel_dispatch(self, channel_number: int) -> None:
         """Called by BlockingChannel instances to request a call to their
@@ -919,7 +1011,7 @@ class BlockingConnection:
         # Close the connection
         self._impl.close(reply_code, reply_text)
 
-        self._flush_output(self._closed_result.is_ready)
+        self._flush_output(self._current_closed_result().is_ready)
 
     def process_data_events(self, time_limit: float | None = 0) -> None:
         """

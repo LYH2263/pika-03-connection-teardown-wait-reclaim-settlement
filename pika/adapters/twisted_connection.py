@@ -10,11 +10,13 @@ TwistedChannel class for details.
 
 from __future__ import annotations
 
+import contextlib
+
 import functools
 import logging
 import warnings
 from collections import namedtuple
-from typing import TYPE_CHECKING, Any, Callable
+from typing import Tuple, TYPE_CHECKING, Any, Callable
 
 import twisted.internet.base
 import twisted.python.failure
@@ -1121,6 +1123,20 @@ class _TwistedConnectionAdapter(pika.connection.Connection):
         self._disconnect_requested = False
 
     @override
+    def _settlement_snapshot(self) -> Tuple[Any, Any]:
+        """Participant protocol for Connection._teardown_window. The Twisted
+        transport handle is scoped in addition to the core connection state
+        so `connection_lost()` clearing it inside a window does not erase the
+        outer scope's transport view.
+        """
+        return (super()._settlement_snapshot(), self._transport)
+
+    def _settlement_restore(self, token: Tuple[Any, Any]) -> None:
+        """Participant protocol for Connection._teardown_window."""
+        core_token, transport = token
+        super()._settlement_restore(core_token)
+        self._transport = transport
+
     def _adapter_call_later(self, delay: float,
                             callback: Callable[..., None]) -> _TimerHandle:
         """
@@ -1155,11 +1171,25 @@ class _TwistedConnectionAdapter(pika.connection.Connection):
 
     @override
     def _adapter_disconnect_stream(self) -> None:
-        assert self._transport is not None
-        self._disconnect_requested = True
-        self._transport.loseConnection()  # type: ignore[misc]
+        """Implement pure virtual
+        :py:ref:meth:`pika.connection.Connection._adapter_disconnect_stream()`
+         method.
 
-    @override
+        Twisted teardown uses the graceful `ITransport.loseConnection()`
+        semantics, never abort. Inside a nested teardown settlement window an
+        already-routed teardown is reclaimed by the window instead of being
+        routed onto the transport a second time.
+
+        """
+        window = self._teardown_settlement.current
+        if window is not None and self._teardown_settlement.abort_already_routed(
+        ):
+            window.record('nested_teardown_reclaimed', 'loseConnection')
+            return
+        self._transport.loseConnection()  # type: ignore
+        if window is not None:
+            window.record_abort_route('loseConnection')
+
     def _adapter_emit_data(self, data: bytes) -> None:
         """
         :param data: Raw bytes to write to the transport
@@ -1252,6 +1282,114 @@ class TwistedProtocolConnection(protocol.Protocol):
             custom_reactor=custom_reactor,
         )
         self._calls: set[defer.Deferred[Any]] = set()
+
+    def _settlement_snapshot(self) -> Tuple[Any, Any]:
+        """Participant protocol for Connection._teardown_window."""
+        outer_token = (self._calls, self.ready, self.closed)
+        outcome = {
+            'ready_fired': False,
+            'ready_failure': False,
+            'ready_result': None,
+            'closed_fired': False,
+            'closed_result': None,
+        }
+
+        self._calls = set()
+
+        if self.ready is not None:
+            inner_ready = defer.Deferred()
+
+            def _ready_ok(result: Any) -> Any:
+                outcome['ready_fired'] = True
+                outcome['ready_result'] = result
+                return result
+
+            def _ready_fail(failure: Failure) -> Failure:
+                outcome['ready_fired'] = True
+                outcome['ready_failure'] = True
+                outcome['ready_result'] = failure
+                return failure
+
+            inner_ready.addCallbacks(_ready_ok, _ready_fail)
+            self.ready = inner_ready
+
+        if self.closed is not None:
+            inner_closed = defer.Deferred()
+
+            def _closed_ok(result: Any) -> Any:
+                outcome['closed_fired'] = True
+                outcome['closed_result'] = result
+                return result
+
+            inner_closed.addCallback(_closed_ok)
+            self.closed = inner_closed
+
+        return (outer_token, outcome)
+
+    def _settlement_restore(self, token: Tuple[Any, Any]) -> None:
+        """Participant protocol for Connection._teardown_window."""
+        (outer_calls, outer_ready, outer_closed), outcome = token
+        # Calls still registered on the inner surface when we leave
+        inner_calls = self._calls
+        # A closed surface created when opening completed in the window
+        inner_closed_surface = self.closed
+
+        # Restore the outer surfaces before handing anything down
+        self._calls = outer_calls
+        self.ready = outer_ready
+        self.closed = outer_closed
+
+        if outcome['closed_fired']:
+            # The stream terminated while open: settle every outer pending
+            # wait exactly once and complete the outer closed surface.
+            result = outcome['closed_result']
+            payload = result.value if isinstance(result, Failure) else result
+            for pending in list(outer_calls):
+                if not pending.called:
+                    pending.errback(payload)
+            outer_calls.clear()
+            self._calls = set()
+            if outer_closed is not None and not outer_closed.called:
+                outer_closed.callback(payload)
+            self.closed = None
+            return
+
+        if outcome['ready_fired']:
+            if outcome['ready_failure']:
+                # Opening was aborted inside the window: fail the outer ready
+                # surface with the same terminal Failure.
+                failure = outcome['ready_result']
+                if outer_ready is not None and not outer_ready.called:
+                    outer_ready.errback(failure)
+                self.ready = None
+            else:
+                # Opening completed inside the window: complete outer ready
+                # and adopt the closed surface `_on_connection_ready()`
+                # created for the inner scope when the outer had none.
+                result = outcome['ready_result']
+                if outer_ready is not None and not outer_ready.called:
+                    outer_ready.callback(result)
+                self.ready = None
+                if outer_closed is None and inner_closed_surface is not None:
+                    self.closed = inner_closed_surface
+            return
+
+        # No terminal event in the window: pending calls created by inner
+        # work remain serviceable, so merge them back into the outer set.
+        for pending in inner_calls:
+            if not pending.called:
+                outer_calls.add(pending)
+
+    @contextlib.contextmanager
+    def _settlement_window(self) -> Any:
+        """Declare a nested teardown settlement window bound to the same
+        underlying connection (see `Connection._teardown_window`). The
+        connection itself and this protocol wrapper participate together,
+        keeping the Deferred completion surfaces and the core stream teardown
+        under one nested settlement boundary.
+        """
+        with self._impl._teardown_window(self) as window:
+            yield window
 
     def channel(self,
                 channel_number: int | None = None) -> Deferred[TwistedChannel]:
